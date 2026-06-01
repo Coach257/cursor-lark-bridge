@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -91,11 +90,9 @@ func acquirePIDLockV2(baseDir string) error {
 	defer pidFileMu.Unlock()
 
 	if info, err := readPIDFile(baseDir); err == nil && info != nil && info.PID > 0 && info.PID != os.Getpid() {
-		if proc, err := os.FindProcess(info.PID); err == nil {
-			// Signal(0) 探测存活，不真发信号
-			if proc.Signal(syscall.Signal(0)) == nil {
-				return fmt.Errorf("另一个 daemon 已在运行 (PID=%d)，请先 `fb kill` 再启动", info.PID)
-			}
+		// processAlive 按平台分流（Unix: signal 0；Windows: tasklist）
+		if processAlive(info.PID) {
+			return fmt.Errorf("另一个 daemon 已在运行 (PID=%d)，请先 `fb kill` 再启动", info.PID)
 		}
 	}
 

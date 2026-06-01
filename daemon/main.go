@@ -17,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -29,6 +28,9 @@ const (
 	stateFileName  = "state.json"
 	pidFileName    = "daemon.pid"
 	approveTimeout = 10 * time.Minute
+	// stopTimeout：Agent 停止后的暂停卡片等待时长。设为约 1 年 ≈ 永久，
+	// 不会自动结束——只有用户主动「结束会话 / skip」才结束本轮。
+	stopTimeout = 365 * 24 * time.Hour
 	// supervisor 指数退避：2s → 4s → ... → 5min 封顶
 	supervisorInitialBackoff = 2 * time.Second
 	supervisorMaxBackoff     = 5 * time.Minute
@@ -332,12 +334,12 @@ func (d *Daemon) startEventSubscription(ctx context.Context) {
 // backoff 由 supervisor 持有并传入，readEvents 收到首条事件时会在其上调 Reset。
 func (d *Daemon) runOneSubscription(ctx context.Context, backoff *backoffState) {
 	logInfo("启动 lark-cli event +subscribe ...")
-	cmd := exec.CommandContext(ctx, "lark-cli", "event", "+subscribe",
+	cmd := larkCLICmdCtx(ctx, "event", "+subscribe",
 		"--event-types", "im.message.receive_v1,card.action.trigger",
 		"--compact", "--quiet", "--as", "bot")
 
-	// 独立 process group，daemon 退出时可以通过负 PID 一次端掉整条链
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// 独立 process group（仅 Unix 有意义），daemon 退出时整组/整树端掉
+	setProcGroup(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -385,27 +387,8 @@ func (d *Daemon) runOneSubscription(ctx context.Context, backoff *backoffState) 
 	logInfo("lark-cli event +subscribe 已退出")
 }
 
-// cleanupStaleLarkCLIEvent 尽力清理可能遗留的 lark-cli event +subscribe 进程
-// reason 仅用于日志区分是启动清理还是冲突清理
-func cleanupStaleLarkCLIEvent(reason string) {
-	patterns := []string{
-		"lark-cli.*event .subscribe",
-		"@larksuite/cli.*event .subscribe",
-	}
-	cleaned := false
-	for _, p := range patterns {
-		// -9 保证即使子进程在 uninterruptible sleep / sigterm 被忽略时也能被清
-		if err := exec.Command("pkill", "-9", "-f", p).Run(); err == nil {
-			cleaned = true
-		}
-	}
-	if cleaned {
-		logInfo("[cleanup:%s] 已清理残留的 lark-cli event 进程", reason)
-	}
-}
-
-// killEventSubprocess 对 lark-cli 子进程组发 SIGTERM，3s 仍未退出则 SIGKILL
-// 用于 daemon 优雅退出路径，避免孤儿
+// killEventSubprocess 终止 lark-cli 子进程（连同其子孙），用于 daemon 优雅退出路径，
+// 避免遗留孤儿。具体的信号 / taskkill 实现按平台分流到 terminateProcessTree。
 func (d *Daemon) killEventSubprocess() {
 	d.eventCmdMu.Lock()
 	cmd := d.eventCmd
@@ -413,30 +396,7 @@ func (d *Daemon) killEventSubprocess() {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	pid := cmd.Process.Pid
-	// 负 PID 向整个 process group 发信号；Setpgid 时 pgid == pid
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	// 冗余一次向直接子进程发 SIGTERM，兼容 Setpgid 失败的场景
-	_ = syscall.Kill(pid, syscall.SIGTERM)
-
-	done := make(chan struct{})
-	go func() {
-		// cmd.Wait 可能已被订阅循环调用，这里再 Wait 会返回 "Wait was already called"，
-		// 所以用轮询 Process.Signal(0) 判断进程是否消失
-		for {
-			if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
-				close(done)
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-	}
+	terminateProcessTree(cmd.Process)
 }
 
 // cappedWriter 限制 buffer 最多 max 字节，防止 stderr 无限增长吃内存
@@ -626,6 +586,39 @@ func (d *Daemon) sendConfirmation(action, agent string) {
 	}
 }
 
+// sendRunningNotice 在用户的文字消息被成功派发给某个 pending 后立刻回执一张
+// "运行中"卡片：告诉用户消息已收到、Agent 正在按此执行，完成后会再发暂停卡片。
+// 由 dispatchTextReply 以 goroutine 调用，不阻塞分发。
+func (d *Daemon) sendRunningNotice(text, agent string) {
+	card := buildNotifyCard(NotifyRequest{
+		Title:   "🏃 Agent 运行中",
+		Content: fmt.Sprintf("已收到消息：**%s**\n\nAgent 正在执行，完成后会再发卡片。", truncate(text, 200)),
+		Color:   "blue",
+		Context: "运行中",
+		Agent:   agent,
+	})
+	if err := d.sendCard(card); err != nil {
+		logErr("发送运行中提示卡片失败: %v", err)
+	}
+}
+
+// sendRestartNotice 在 daemon 重启后提醒用户：内存里的挂起会话（pending）在重启时
+// 已全部丢失，飞书里之前的暂停/审批卡片已失效（点击不会有反应），需要回到 Cursor
+// 重新发指令开启新会话。仅在「检测到这是一次重启」且已配置 open_id 时调用。
+func (d *Daemon) sendRestartNotice() {
+	// 略等启动 settle，避免与 lark-cli 订阅刚拉起时抢资源
+	time.Sleep(1500 * time.Millisecond)
+	card := buildNotifyCard(NotifyRequest{
+		Title:   "🔄 飞书桥已重启",
+		Content: "桥接服务刚刚重启，**之前的暂停/审批卡片已全部失效**（点击不会有反应）。\n\n请回到 Cursor 窗口**重新发送一条指令**开启新会话，之后这里的消息和按钮就能正常接收。",
+		Color:   "orange",
+		Context: "服务重启",
+	})
+	if err := d.sendCard(card); err != nil {
+		logErr("发送重启提示卡片失败: %v", err)
+	}
+}
+
 // 文字回复：FIFO 分发到最早的等待请求
 func (d *Daemon) dispatchTextReply(text string) {
 	d.pendingMu.Lock()
@@ -636,7 +629,11 @@ func (d *Daemon) dispatchTextReply(text string) {
 	for id, entry := range d.pending {
 		select {
 		case entry.reply <- text:
+			agent := entry.agent
 			delete(d.pending, id)
+			// 立刻回一张"运行中"卡片，让用户知道消息已被接收、Agent 已开始执行，
+			// 不必干等到下一张暂停卡片。异步发送，避免阻塞分发路径。
+			go d.sendRunningNotice(text, agent)
 			return
 		default:
 		}
@@ -751,7 +748,7 @@ func (d *Daemon) stopAllPending() ([]PendingView, int) {
 // ── lark-cli 发消息 ──
 
 func (d *Daemon) sendCard(cardJSON string) error {
-	cmd := exec.Command("lark-cli", "im", "+messages-send",
+	cmd := larkCLICmd("im", "+messages-send",
 		"--user-id", d.config.OpenID,
 		"--msg-type", "interactive",
 		"--content", cardJSON,
@@ -765,7 +762,7 @@ func (d *Daemon) sendCard(cardJSON string) error {
 
 // sendText 通过 lark-cli 发一条纯文字消息给当前配置的 open_id，供斜杠命令回复使用。
 func (d *Daemon) sendText(content string) error {
-	cmd := exec.Command("lark-cli", "im", "+messages-send",
+	cmd := larkCLICmd("im", "+messages-send",
 		"--user-id", d.config.OpenID,
 		"--msg-type", "text",
 		"--content", content,
@@ -988,10 +985,11 @@ func (d *Daemon) handleStop(w http.ResponseWriter, r *http.Request) {
 		agent:     req.Agent,
 	}
 
-	reply, err := d.waitReply(requestID, meta, approveTimeout)
+	// 用 stopTimeout（≈永久）：暂停卡片一直等用户回复或点「结束会话」，
+	// 不再 10 分钟自动结束。仅极端兜底（约 1 年）才会触发超时。
+	reply, err := d.waitReply(requestID, meta, stopTimeout)
 	if err != nil {
-		// 超时当作"结束会话"，不注入 followup
-		logInfo("stop hook 等待回复超时，按结束处理")
+		logInfo("stop hook 等待回复超时（已达 stopTimeout 兜底），按结束处理")
 		writeJSON(w, StopResponse{Reply: "skip"})
 		return
 	}
@@ -1002,6 +1000,33 @@ func (d *Daemon) handleStop(w http.ResponseWriter, r *http.Request) {
 // ── 卡片构建 ──
 
 // buildNoteElement 统一生成卡片底部 note：第一行是操作上下文，第二行是 Agent 标识（非空才显示）
+// agentBadge 按 Agent 标识稳定映射到一个颜色 emoji。多个 Cursor 窗口并行时，
+// 同一会话的卡片永远是同一种颜色，不同会话大概率不同色，便于一眼归组。
+// agent 为空（如重启通知）时返回空串。
+func agentBadge(agent string) string {
+	if strings.TrimSpace(agent) == "" {
+		return ""
+	}
+	palette := []string{"🟦", "🟩", "🟧", "🟪", "🟥", "🟨", "🟫", "🔵", "🟢", "🟠", "🟣", "🔴", "🟡", "🟤"}
+	// FNV-1a 32 位哈希，纯展示用途，无需加密强度。
+	var h uint32 = 2166136261
+	for i := 0; i < len(agent); i++ {
+		h ^= uint32(agent[i])
+		h *= 16777619
+	}
+	return palette[int(h%uint32(len(palette)))]
+}
+
+// titleWithAgent 把「颜色徽标 + 原标题 + Agent 标识」拼成卡片标题，
+// 让多 Agent 并行时在标题处就能一眼分清是哪个会话。agent 为空时只返回原标题。
+func titleWithAgent(title, agent string) string {
+	a := strings.TrimSpace(agent)
+	if a == "" {
+		return title
+	}
+	return agentBadge(a) + " " + title + " · " + a
+}
+
 func buildNoteElement(contextNote, agent string) map[string]interface{} {
 	elements := []interface{}{
 		map[string]interface{}{
@@ -1037,6 +1062,7 @@ func buildApproveCard(req ApproveRequest, requestID string) string {
 	if contextNote == "" {
 		contextNote = "Cursor Agent 请求"
 	}
+	title = titleWithAgent(title, req.Agent)
 
 	card := map[string]interface{}{
 		"config": map[string]interface{}{"wide_screen_mode": true},
@@ -1129,7 +1155,7 @@ func buildAskCard(req AskRequest, requestID string) string {
 	card := map[string]interface{}{
 		"config": map[string]interface{}{"wide_screen_mode": true},
 		"header": map[string]interface{}{
-			"title":    map[string]interface{}{"tag": "plain_text", "content": "❓ 需要您的回复"},
+			"title":    map[string]interface{}{"tag": "plain_text", "content": titleWithAgent("❓ 需要您的回复", req.Agent)},
 			"template": "blue",
 		},
 		"elements": elements,
@@ -1150,13 +1176,14 @@ func buildStopCard(req StopRequest, requestID string) string {
 		title = "🛑 Agent 已中止"
 		color = "grey"
 	}
+	title = titleWithAgent(title, req.Agent)
 
 	summary := strings.TrimSpace(req.Summary)
 	if summary == "" {
 		summary = "_(Agent 没有最终输出)_"
-	} else if len(summary) > 800 {
-		// 仅截尾部，保留最新信息
-		summary = "…" + summary[len(summary)-800:]
+	} else {
+		// 飞书 lark_md 单块不宜过长；保留开头便于阅读结论与步骤
+		summary = truncateForCardDisplay(summary, 2500)
 	}
 
 	contentBody := fmt.Sprintf("**Agent 最后的输出：**\n%s", summary)
@@ -1211,7 +1238,7 @@ func buildStopCard(req StopRequest, requestID string) string {
 	})
 
 	elements = append(elements, buildNoteElement(
-		fmt.Sprintf("Agent 停止 · loop=%d · 10 分钟未回复自动结束", req.LoopCount),
+		fmt.Sprintf("Agent 停止 · loop=%d · 等待你的指令（不会自动结束，除非点「结束会话」）", req.LoopCount),
 		req.Agent,
 	))
 
@@ -1241,6 +1268,7 @@ func buildNotifyCard(req NotifyRequest) string {
 	if contextNote == "" {
 		contextNote = "Cursor Agent"
 	}
+	title = titleWithAgent(title, req.Agent)
 
 	card := map[string]interface{}{
 		"config": map[string]interface{}{"wide_screen_mode": true},
@@ -1303,6 +1331,16 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// truncateForCardDisplay 飞书卡片展示用：保留开头，避免长回复只看到尾部。
+// maxRunes 按 Unicode 字符计（中文不会被截断成乱码）。
+func truncateForCardDisplay(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…（内容过长，已截断）"
+}
+
 // summarizeOneLine 把多行 lark_md 内容压成一行（换行变空格），再截到 n 字，
 // 给 pending metadata 的 summary fallback 用
 func summarizeOneLine(s string, n int) string {
@@ -1337,6 +1375,10 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 
 func main() {
 	baseDir := filepath.Join(homeDir(), ".cursor", "cursor-lark-bridge")
+	// state 文件已存在 => 这是一次重启（而非首次安装）。重启会丢失内存里的挂起会话，
+	// 故稍后给用户发一张"桥已重启、旧卡片失效"的提示卡片。
+	_, stateStatErr := os.Stat(filepath.Join(baseDir, stateFileName))
+	isRestart := stateStatErr == nil
 	dl, err := setupLogging(baseDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[FATAL] setup logging: %v\n", err)
@@ -1360,6 +1402,11 @@ func main() {
 
 	d.startEventSubscription(ctx)
 
+	// 重启提示：内存里的挂起会话已随上次进程退出而丢失，提醒用户去 Cursor 重发指令。
+	if isRestart && d.config.OpenID != "" {
+		go d.sendRestartNotice()
+	}
+
 	server := &http.Server{Addr: listenAddr, Handler: d.setupRoutes()}
 	go func() {
 		logInfo("HTTP API 监听: %s", listenAddr)
@@ -1369,7 +1416,7 @@ func main() {
 	}()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, shutdownSignals()...)
 	sig := <-sigCh
 	logInfo("收到信号 %v，正在关闭...", sig)
 

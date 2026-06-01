@@ -129,7 +129,12 @@ func formatPendingLine(v PendingView, nowUnix int64) string {
 		summary = "(无摘要)"
 	}
 	waited := time.Duration(nowUnix-v.CreatedTS) * time.Second
-	line := fmt.Sprintf("%s **%s** · 等待 %s", icon, summary, formatDuration(waited))
+	// 行首加 Agent 颜色徽标，与各卡片标题的颜色保持一致，便于一眼对应到具体会话。
+	prefix := icon
+	if badge := agentBadge(v.Agent); badge != "" {
+		prefix = badge + " " + icon
+	}
+	line := fmt.Sprintf("%s **%s** · 等待 %s", prefix, summary, formatDuration(waited))
 	if v.Workspace != "" {
 		line += fmt.Sprintf(" · `[%s]`", v.Workspace)
 	}

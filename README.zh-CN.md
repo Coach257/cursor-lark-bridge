@@ -196,7 +196,8 @@ cursor-lark-bridge/
 | **电脑息屏一段时间后，消息就收不到了** | 上一次 daemon 非正常退出留下了 `lark-cli event +subscribe` 孤儿，霸占"一个 app 只能一个订阅者"的坑位，新启动的订阅始终拿不到 WebSocket | `fb doctor --fix`（会精确识别并清理孤儿，daemon 自动重连） |
 | **一次交互收到两张授权卡片，第二张的按钮点了没反应** | `~/.cursor/hooks.json` 里同时保留了老版 `hooks/feishu-bridge/*` 和新版 `hooks/cursor-lark-bridge/*` 条目，每次交互被触发两次；而 Cursor 只 wait **第一个**返回的 hook 结果，第二张卡片的按钮事件被丢弃 | `fb doctor --fix`（会备份 hooks.json，过滤掉老条目，删掉老目录） |
 | `daemon.log` 里出现 `HTTP 400: open_id cross app` | `config.json` 里的 `open_id` 和 `lark-cli` 当前绑定的应用不是同一个 | `fb init --force` 重新自动探测 |
-| 卡片到了但按钮点了没反应（**只有一张卡片**的情况） | 多半是 lark-cli scope / 权限问题 | 看 `~/.cursor/cursor-lark-bridge/daemon.log`；确认机器人/应用开了 `im:message:send_as_bot` 等发消息作用域 |
+| 点卡片按钮报 **200340** /「结束会话」「继续执行」无效，但**发文字可以** | 只配了事件订阅里的 `im.message`，未在 **回调配置** 长连接订阅 `card.action.trigger`，或未开「卡片回传交互」 | 按 [windows/FEISHU-APP-SETUP.zh-CN.md](./windows/FEISHU-APP-SETUP.zh-CN.md) 配回调并**发布新版本**；临时可发文字 `skip` 或 `/stop` |
+| 卡片到了但按钮点了没反应（**只有一张卡片**的情况） | 多半是 lark-cli scope / 权限问题 | 看 `~/.cursor/cursor-lark-bridge/logs/daemon-*.log`；确认机器人/应用开了 `im:message:send_as_bot` 等发消息作用域 |
 | `fb status` 显示"事件订阅: 不稳定（正在重启，累计重启 N 次）" | 有进程在抢同一个订阅（常见：老版 daemon 还活着 / 上轮孤儿没清干净） | `fb doctor --fix` |
 | `fb` 命令找不到 | `PATH` 里没有 `~/.local/bin` | 把 `~/.local/bin` 加到 `PATH` |
 | `command not found: lark-cli` | 还没装 lark-cli | [安装 lark-cli](https://github.com/larksuite/lark-cli) |
