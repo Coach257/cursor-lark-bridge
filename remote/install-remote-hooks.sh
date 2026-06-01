@@ -517,7 +517,7 @@ additions = {
     # "beforeMCPExecution":   [{"command": h("mcp-approve.sh"),   "timeout": 600}],
     "preToolUse":           [{"command": h("pretool-approve.sh"), "matcher": "AskQuestion|SwitchMode", "timeout": 600}],
     "afterAgentResponse":   [{"command": h("agent-response.sh"), "timeout": 5}],
-    "stop":                 [{"command": h("on-stop.sh"), "timeout": 600, "loop_limit": 20}],
+    "stop":                 [{"command": h("on-stop.sh"), "timeout": 31536000, "loop_limit": 20}],
 }
 
 doc = {}

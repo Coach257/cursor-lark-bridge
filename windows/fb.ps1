@@ -250,7 +250,7 @@ function Build-HookAdditions {
         # beforeMCPExecution   = @(@{ command = (HookCmd "mcp-approve.js");   timeout = 600 })
         preToolUse           = @(@{ command = (HookCmd "pretool-approve.js"); matcher = "AskQuestion|SwitchMode"; timeout = 600 })
         afterAgentResponse   = @(@{ command = (HookCmd "agent-response.js"); timeout = 5 })
-        stop                 = @(@{ command = (HookCmd "on-stop.js"); timeout = 600; loop_limit = 20 })
+        stop                 = @(@{ command = (HookCmd "on-stop.js"); timeout = 31536000; loop_limit = 20 })
     }
 }
 

@@ -1255,7 +1255,8 @@ func buildAskCard(req AskRequest, requestID string) string {
 			"text": map[string]interface{}{"tag": "plain_text", "content": fmt.Sprintf("%d. %s", i+1, opt)},
 			"type": "default",
 			"value": map[string]interface{}{
-				"action":     fmt.Sprintf("%d", i+1),
+				// 回传选项原文（而非编号），Agent 直接拿到明确答案
+				"action":     opt,
 				"request_id": requestID,
 				"label":      opt,
 			},
