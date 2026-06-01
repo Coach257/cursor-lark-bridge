@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -160,7 +161,7 @@ func TestWaitReplyPopulatesPendingView(t *testing.T) {
 	go func() {
 		defer close(done)
 		// 短超时：本测试不关心回复内容，只关心 pending 条目注册期的快照
-		_, _ = d.waitReply("stop-1", pendingMeta{
+		_, _ = d.waitReply(context.Background(), "stop-1", pendingMeta{
 			kind:      "stop",
 			summary:   "agent idle",
 			workspace: "demo",

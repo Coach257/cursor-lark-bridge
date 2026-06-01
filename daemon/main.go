@@ -34,6 +34,9 @@ const (
 	// supervisor 指数退避：2s → 4s → ... → 5min 封顶
 	supervisorInitialBackoff = 2 * time.Second
 	supervisorMaxBackoff     = 5 * time.Minute
+	// replyTargetTTL：点卡片「💬 回复文本」选定目标后的有效期；超时自动失效，
+	// 之后的文字消息回落到普通派发，避免一条无关消息被误投给旧会话。
+	replyTargetTTL = 10 * time.Minute
 )
 
 // ── 配置 & 状态 ──
@@ -101,6 +104,13 @@ type Daemon struct {
 	lastEventAt  atomic.Int64 // UnixMilli，最近一次收到事件流输出的时间
 	subscribeOK  atomic.Bool  // 当前 lark-cli 子进程是否成功稳定订阅（启动后 2s 仍未退出即视为 OK）
 	restartCount atomic.Int64 // 累计的 lark-cli 重启次数（诊断用）
+
+	// 文字回复精确路由：用户点某张卡片的「💬 回复文本」按钮后，记录其 request_id；
+	// 下一条文字消息精确投递给它，而非在多个 pending 间随机派发。一次性 + TTL 过期。
+	replyTargetMu    sync.Mutex
+	replyTargetID    string
+	replyTargetAgent string
+	replyTargetAt    time.Time
 }
 
 // ── 事件解析 ──
@@ -523,6 +533,13 @@ func (d *Daemon) handleCardActionEvent(line string) {
 		return
 	}
 
+	// 「💬 回复文本」按钮：不是一次决策，而是选定「下一条文字消息精确投递给此会话」
+	if bv.Action == "reply_text" {
+		logInfo("收到「回复文本」按钮: request_id=%s", bv.RequestID)
+		d.selectReplyTarget(bv.RequestID)
+		return
+	}
+
 	replyText := bv.Action
 	if replyText == "" {
 		replyText = bv.Label
@@ -619,13 +636,117 @@ func (d *Daemon) sendRestartNotice() {
 	}
 }
 
-// 文字回复：FIFO 分发到最早的等待请求
+// selectReplyTarget 处理「💬 回复文本」按钮：把该 request_id 记为下一条文字消息的
+// 精确投递目标，并回执提示卡片。若该 pending 已不存在（结束/超时），提示用户已失效。
+func (d *Daemon) selectReplyTarget(requestID string) {
+	d.pendingMu.RLock()
+	entry, ok := d.pending[requestID]
+	var agent string
+	if ok {
+		agent = entry.agent
+	}
+	d.pendingMu.RUnlock()
+
+	if !ok {
+		go func() {
+			if err := d.sendCard(buildNotifyCard(NotifyRequest{
+				Title:   "⚠️ 该会话已不可回复",
+				Content: "这张卡片对应的会话已结束或超时，无法再回复。请到对应 Cursor 窗口重新触发。",
+				Color:   "orange",
+				Context: "回复文本",
+			})); err != nil {
+				logErr("发送失效提示卡片失败: %v", err)
+			}
+		}()
+		return
+	}
+
+	d.replyTargetMu.Lock()
+	d.replyTargetID = requestID
+	d.replyTargetAgent = agent
+	d.replyTargetAt = time.Now()
+	d.replyTargetMu.Unlock()
+
+	logInfo("已选定文字回复目标: request_id=%s agent=%s", requestID, agent)
+	label := strings.TrimSpace(agent)
+	if label == "" {
+		label = requestID
+	}
+	go func() {
+		if err := d.sendCard(buildNotifyCard(NotifyRequest{
+			Title:   "✍️ 请输入要回复的内容",
+			Content: fmt.Sprintf("已选定会话 **%s**。\n\n现在**直接发送一条文字消息**，将精确转给该 Agent（%d 分钟内有效）。", label, int(replyTargetTTL.Minutes())),
+			Color:   "blue",
+			Context: "回复文本",
+			Agent:   agent,
+		})); err != nil {
+			logErr("发送回复提示卡片失败: %v", err)
+		}
+	}()
+}
+
+// clearReplyTarget 清除选定的文字回复目标（仅当当前目标仍是 id 时，避免误清后来的选择）
+func (d *Daemon) clearReplyTarget(id string) {
+	d.replyTargetMu.Lock()
+	if d.replyTargetID == id {
+		d.replyTargetID = ""
+		d.replyTargetAgent = ""
+	}
+	d.replyTargetMu.Unlock()
+}
+
+// dispatchToSelectedTarget 若存在未过期的「回复文本」选定目标，则把文字精确投递给它。
+// 返回 true 表示这次文字已被精确路由消费；false 表示无有效目标，应回落到普通派发。
+func (d *Daemon) dispatchToSelectedTarget(text string) bool {
+	d.replyTargetMu.Lock()
+	id := d.replyTargetID
+	at := d.replyTargetAt
+	d.replyTargetMu.Unlock()
+	if id == "" {
+		return false
+	}
+	if time.Since(at) > replyTargetTTL {
+		d.clearReplyTarget(id)
+		logInfo("回复目标已超过 %v 失效: request_id=%s，回落到普通派发", replyTargetTTL, id)
+		return false
+	}
+
+	d.pendingMu.Lock()
+	entry, ok := d.pending[id]
+	if ok {
+		select {
+		case entry.reply <- text:
+			agent := entry.agent
+			delete(d.pending, id)
+			d.pendingMu.Unlock()
+			d.clearReplyTarget(id)
+			logInfo("文字精确投递到选定目标: request_id=%s", id)
+			go d.sendRunningNotice(text, agent)
+			return true
+		default:
+			d.pendingMu.Unlock()
+			d.clearReplyTarget(id)
+			return false
+		}
+	}
+	d.pendingMu.Unlock()
+	d.clearReplyTarget(id)
+	logInfo("选定的回复目标已失效（pending 不存在）: request_id=%s，回落到普通派发", id)
+	return false
+}
+
+// 文字回复：先看有没有「回复文本」选定的精确目标，没有再 FIFO 派发到任意等待请求
 func (d *Daemon) dispatchTextReply(text string) {
+	// 精确路由优先：用户刚点过某卡片的「💬 回复文本」且未过期 → 精确投递
+	if d.dispatchToSelectedTarget(text) {
+		return
+	}
+
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
 
 	// map 遍历顺序不保证，多请求并存时可能派发到任意一个；
-	// 多 Agent 并行场景建议使用按钮回复以精确定位
+	// 多 Agent 并行场景建议先点卡片「💬 回复文本」精确定位，再发消息
 	for id, entry := range d.pending {
 		select {
 		case entry.reply <- text:
@@ -644,7 +765,7 @@ func (d *Daemon) dispatchTextReply(text string) {
 // waitReply 注册一个 pending 条目，阻塞等待来自 lark 的按钮/文字回复
 // 或 timeout 超时。meta 里的 kind/summary/workspace/agent 会一起存进
 // pendingEntry，方便 /status 斜杠命令快照时展示。
-func (d *Daemon) waitReply(requestID string, meta pendingMeta, timeout time.Duration) (string, error) {
+func (d *Daemon) waitReply(ctx context.Context, requestID string, meta pendingMeta, timeout time.Duration) (string, error) {
 	entry := &pendingEntry{
 		reply:     make(chan string, 1),
 		id:        requestID,
@@ -667,6 +788,10 @@ func (d *Daemon) waitReply(requestID string, meta pendingMeta, timeout time.Dura
 	select {
 	case reply := <-entry.reply:
 		return reply, nil
+	case <-ctx.Done():
+		// hook 侧（含远程 SSH 反向隧道）连接断开：立即注销该 pending，
+		// 避免它变成"僵尸"——后续文字回复会被随机派发到它而被静默丢弃。
+		return "", fmt.Errorf("hook 连接断开，取消等待: %w", ctx.Err())
 	case <-time.After(timeout):
 		return "", fmt.Errorf("等待回复超时 (%v)", timeout)
 	}
@@ -873,7 +998,7 @@ func (d *Daemon) handleApprove(w http.ResponseWriter, r *http.Request) {
 		agent:     req.Agent,
 	}
 
-	reply, err := d.waitReply(requestID, meta, approveTimeout)
+	reply, err := d.waitReply(r.Context(), requestID, meta, approveTimeout)
 	if err != nil {
 		logErr("等待审批回复失败: %v", err)
 		writeJSON(w, ApproveResponse{Decision: "allow"})
@@ -919,7 +1044,7 @@ func (d *Daemon) handleAsk(w http.ResponseWriter, r *http.Request) {
 		agent:     req.Agent,
 	}
 
-	reply, err := d.waitReply(requestID, meta, approveTimeout)
+	reply, err := d.waitReply(r.Context(), requestID, meta, approveTimeout)
 	if err != nil {
 		logErr("等待提问回复失败: %v", err)
 		httpErr(w, "timeout", http.StatusGatewayTimeout)
@@ -987,9 +1112,9 @@ func (d *Daemon) handleStop(w http.ResponseWriter, r *http.Request) {
 
 	// 用 stopTimeout（≈永久）：暂停卡片一直等用户回复或点「结束会话」，
 	// 不再 10 分钟自动结束。仅极端兜底（约 1 年）才会触发超时。
-	reply, err := d.waitReply(requestID, meta, stopTimeout)
+	reply, err := d.waitReply(r.Context(), requestID, meta, stopTimeout)
 	if err != nil {
-		logInfo("stop hook 等待回复超时（已达 stopTimeout 兜底），按结束处理")
+		logInfo("stop hook 等待结束（连接断开或达 stopTimeout 兜底），按结束处理: %v", err)
 		writeJSON(w, StopResponse{Reply: "skip"})
 		return
 	}
@@ -1122,35 +1247,37 @@ func buildAskCard(req AskRequest, requestID string) string {
 		map[string]interface{}{"tag": "hr"},
 	}
 
-	// 有选项时添加选项按钮
-	if len(req.Options) > 0 {
-		buttons := make([]interface{}, 0, len(req.Options))
-		for i, opt := range req.Options {
-			buttons = append(buttons, map[string]interface{}{
-				"tag":  "button",
-				"text": map[string]interface{}{"tag": "plain_text", "content": fmt.Sprintf("%d. %s", i+1, opt)},
-				"type": "default",
-				"value": map[string]interface{}{
-					"action":     fmt.Sprintf("%d", i+1),
-					"request_id": requestID,
-					"label":      opt,
-				},
-			})
-		}
-		elements = append(elements, map[string]interface{}{
-			"tag":     "action",
-			"actions": buttons,
+	// 选项按钮（若有）+ 始终带一个「💬 回复文本」精确路由按钮
+	buttons := make([]interface{}, 0, len(req.Options)+1)
+	for i, opt := range req.Options {
+		buttons = append(buttons, map[string]interface{}{
+			"tag":  "button",
+			"text": map[string]interface{}{"tag": "plain_text", "content": fmt.Sprintf("%d. %s", i+1, opt)},
+			"type": "default",
+			"value": map[string]interface{}{
+				"action":     fmt.Sprintf("%d", i+1),
+				"request_id": requestID,
+				"label":      opt,
+			},
 		})
-		elements = append(elements, buildNoteElement(
-			fmt.Sprintf("%s（点击按钮或直接发消息回复）", contextNote),
-			req.Agent,
-		))
-	} else {
-		elements = append(elements, buildNoteElement(
-			fmt.Sprintf("%s（请直接发消息回复）", contextNote),
-			req.Agent,
-		))
 	}
+	buttons = append(buttons, map[string]interface{}{
+		"tag":  "button",
+		"text": map[string]interface{}{"tag": "plain_text", "content": "💬 回复文本"},
+		"type": "primary",
+		"value": map[string]interface{}{
+			"action":     "reply_text",
+			"request_id": requestID,
+		},
+	})
+	elements = append(elements, map[string]interface{}{
+		"tag":     "action",
+		"actions": buttons,
+	})
+	elements = append(elements, buildNoteElement(
+		fmt.Sprintf("%s（点选项按钮，或点「💬 回复文本」后发消息精确回复）", contextNote),
+		req.Agent,
+	))
 
 	card := map[string]interface{}{
 		"config": map[string]interface{}{"wide_screen_mode": true},
@@ -1196,41 +1323,48 @@ func buildStopCard(req StopRequest, requestID string) string {
 		map[string]interface{}{"tag": "hr"},
 	}
 
-	// 仅 completed 状态提供继续按钮；aborted/error 只允许结束
-	actions := []interface{}{
-		map[string]interface{}{
-			"tag":  "button",
-			"text": map[string]interface{}{"tag": "plain_text", "content": "🛑 结束会话"},
-			"type": "danger",
-			"value": map[string]interface{}{
-				"action":     "skip",
-				"request_id": requestID,
-			},
+	// 「💬 回复文本」：点后下一条文字消息精确投递给本会话（多窗口并行时推荐）
+	replyTextBtn := map[string]interface{}{
+		"tag":  "button",
+		"text": map[string]interface{}{"tag": "plain_text", "content": "💬 回复文本"},
+		"type": "default",
+		"value": map[string]interface{}{
+			"action":     "reply_text",
+			"request_id": requestID,
 		},
 	}
-	if req.Status == "completed" {
-		// "继续" 按钮放在前面，默认主按钮
-		actions = append([]interface{}{
-			map[string]interface{}{
-				"tag":  "button",
-				"text": map[string]interface{}{"tag": "plain_text", "content": "▶️ 继续执行"},
-				"type": "primary",
-				"value": map[string]interface{}{
-					"action":     "继续",
-					"request_id": requestID,
-				},
-			},
-		}, actions...)
+	skipBtn := map[string]interface{}{
+		"tag":  "button",
+		"text": map[string]interface{}{"tag": "plain_text", "content": "🛑 结束会话"},
+		"type": "danger",
+		"value": map[string]interface{}{
+			"action":     "skip",
+			"request_id": requestID,
+		},
 	}
+	// 顺序：[继续(仅 completed)] · 回复文本 · 结束会话
+	actions := []interface{}{}
+	if req.Status == "completed" {
+		actions = append(actions, map[string]interface{}{
+			"tag":  "button",
+			"text": map[string]interface{}{"tag": "plain_text", "content": "▶️ 继续执行"},
+			"type": "primary",
+			"value": map[string]interface{}{
+				"action":     "继续",
+				"request_id": requestID,
+			},
+		})
+	}
+	actions = append(actions, replyTextBtn, skipBtn)
 
 	elements = append(elements, map[string]interface{}{
 		"tag":     "action",
 		"actions": actions,
 	})
 
-	tip := "💬 **直接发消息** → 作为下一条指令发给 Agent\n🛑 **结束会话** → 停止本轮对话"
+	tip := "💬 **回复文本** → 点后发消息，精确转给本会话（多窗口推荐）\n🛑 **结束会话** → 停止本轮对话"
 	if req.Status == "completed" {
-		tip = "▶️ **继续执行** → 让 Agent 按默认继续\n💬 **直接发消息** → 自定义下一条指令\n🛑 **结束会话** → 停止本轮对话"
+		tip = "▶️ **继续执行** → 让 Agent 按默认继续\n💬 **回复文本** → 点后发消息，精确转给本会话（多窗口推荐）\n🛑 **结束会话** → 停止本轮对话"
 	}
 	elements = append(elements, map[string]interface{}{
 		"tag":  "div",
