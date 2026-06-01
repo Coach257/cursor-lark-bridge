@@ -72,7 +72,7 @@
 
 ```mermaid
 graph LR
-    Main["main worktree<br/>/Users/bytedance/repos/cursor-lark-bridge<br/>分支: main"]
+    Main["main worktree<br/>~/repos/cursor-lark-bridge<br/>分支: main"]
     Work["work worktree<br/>~/work/cursor-lark-bridge-v2<br/>分支: feat/v2-ops-and-slash"]
     Main -- "git worktree add" --> Work
     Main -. "Planner 维护 docs/plans/*.md" .-> Main

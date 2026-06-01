@@ -8,6 +8,8 @@ config.json
 # 编译产物
 daemon/cursor-lark-bridge-daemon
 daemon/*.test
+*.exe
+daemon/*.exe
 dist/
 tmp/
 
