@@ -822,6 +822,32 @@ func (d *Daemon) snapshotPending() []PendingView {
 	return views
 }
 
+// supersedeSameAgentStops 在同一会话(agent)产生新的 stop 时，作废它之前还挂着的旧
+// stop 暂停卡片。背景：用户若直接在 Cursor 窗口里推进 Agent（而非通过飞书回复），每停
+// 一次都会留下一个仍阻塞、永不超时(stopTimeout≈1年)的旧 stop hook，导致 /status 里
+// 同一会话堆叠出多张陈旧暂停卡。一个会话同一时刻只应有一张「当前」暂停卡，新 stop 到达
+// 即说明旧的已过时，给它们发 "skip" 让对应(多半已成孤儿的)hook 干净退出。
+//
+// 仅按非空 agent 精确匹配，避免空标识误伤其它会话。非阻塞 send + 不主动 delete，
+// 与 stopAllPending 保持一致的生命周期契约（waitReply 的 defer 负责清理）。
+func (d *Daemon) supersedeSameAgentStops(agent, exceptRequestID string) {
+	if strings.TrimSpace(agent) == "" {
+		return
+	}
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+	for id, e := range d.pending {
+		if id == exceptRequestID || e.kind != "stop" || e.agent != agent {
+			continue
+		}
+		select {
+		case e.reply <- "skip":
+			logInfo("同一会话产生新 stop，作废旧暂停卡片: request_id=%s agent=%s", id, agent)
+		default:
+		}
+	}
+}
+
 // stopAllPending 尝试取消所有 pending 操作，供 /stop 斜杠命令调用。
 //
 // 按 kind 分派 reply 内容：
@@ -1109,6 +1135,10 @@ func (d *Daemon) handleStop(w http.ResponseWriter, r *http.Request) {
 		workspace: req.Workspace,
 		agent:     req.Agent,
 	}
+
+	// 同一会话的新 stop 到达 → 作废它之前还挂着的旧暂停卡，避免 /status 里堆叠
+	// 同一会话的多张陈旧卡片（尤其在 stop 永不超时、用户直接在 Cursor 里推进时）。
+	d.supersedeSameAgentStops(req.Agent, requestID)
 
 	// 用 stopTimeout（≈永久）：暂停卡片一直等用户回复或点「结束会话」，
 	// 不再 10 分钟自动结束。仅极端兜底（约 1 年）才会触发超时。
