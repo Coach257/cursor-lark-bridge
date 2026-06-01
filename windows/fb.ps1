@@ -243,9 +243,11 @@ function Build-HookAdditions {
     if (-not $node) { $node = "C:\Program Files\nodejs\node.exe" }
     if (-not (Test-Path $node)) { $node = "node" }
     function HookCmd($script) { return "`"$node`" `"$(Join-Path $HooksDir $script)`"" }
+    # 按用户偏好：不注册 shell / MCP 审批 hook（命令直接执行，不走飞书逐条把关）。
+    # 如需恢复审批，取消下面两行注释即可。
     return [ordered]@{
-        beforeShellExecution = @(@{ command = (HookCmd "shell-approve.js"); timeout = 600 })
-        beforeMCPExecution   = @(@{ command = (HookCmd "mcp-approve.js");   timeout = 600 })
+        # beforeShellExecution = @(@{ command = (HookCmd "shell-approve.js"); timeout = 600 })
+        # beforeMCPExecution   = @(@{ command = (HookCmd "mcp-approve.js");   timeout = 600 })
         preToolUse           = @(@{ command = (HookCmd "pretool-approve.js"); matcher = "AskQuestion|SwitchMode"; timeout = 600 })
         afterAgentResponse   = @(@{ command = (HookCmd "agent-response.js"); timeout = 5 })
         stop                 = @(@{ command = (HookCmd "on-stop.js"); timeout = 600; loop_limit = 20 })

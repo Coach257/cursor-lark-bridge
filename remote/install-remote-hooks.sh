@@ -504,9 +504,17 @@ def h(name):
     # 远程恒为 Linux：强制正斜杠，确保命令路径含 MARKER（保证重装幂等）
     return f'bash {hooks_dir.rstrip("/")}/{name}'
 
+# 所有本桥接可能注册的事件（用于重装时统一清理旧条目）
+ALL_CLB_EVENTS = (
+    "beforeShellExecution", "beforeMCPExecution",
+    "preToolUse", "afterAgentResponse", "stop",
+)
+
+# 按用户偏好：不注册 shell / MCP 审批 hook（命令直接执行，不走飞书逐条把关）。
+# 如需恢复审批，把下面两行取消注释即可。
 additions = {
-    "beforeShellExecution": [{"command": h("shell-approve.sh"), "timeout": 600}],
-    "beforeMCPExecution":   [{"command": h("mcp-approve.sh"),   "timeout": 600}],
+    # "beforeShellExecution": [{"command": h("shell-approve.sh"), "timeout": 600}],
+    # "beforeMCPExecution":   [{"command": h("mcp-approve.sh"),   "timeout": 600}],
     "preToolUse":           [{"command": h("pretool-approve.sh"), "matcher": "AskQuestion|SwitchMode", "timeout": 600}],
     "afterAgentResponse":   [{"command": h("agent-response.sh"), "timeout": 5}],
     "stop":                 [{"command": h("on-stop.sh"), "timeout": 600, "loop_limit": 20}],
@@ -523,6 +531,16 @@ def is_clb(e):
     return isinstance(e, dict) and MARKER in str(e.get("command", ""))
 
 def merge_events(target):
+    # 先把所有事件里的旧 CLB 条目清掉（这样禁用某个 hook 后重装能真正移除它）
+    for ev in ALL_CLB_EVENTS:
+        cur = target.get(ev)
+        if isinstance(cur, list):
+            cleaned = [e for e in cur if not is_clb(e)]
+            if cleaned:
+                target[ev] = cleaned
+            else:
+                target.pop(ev, None)
+    # 再加入当前要启用的 hook
     for ev, entries in additions.items():
         cur = target.get(ev)
         cur = list(cur) if isinstance(cur, list) else ([] if cur is None else [cur])
