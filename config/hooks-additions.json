@@ -27,8 +27,8 @@
   "stop": [
     {
       "command": "bash ./hooks/cursor-lark-bridge/on-stop.sh",
-      "timeout": 31536000,
-      "loop_limit": 20
+      "timeout": 1209600,
+      "loop_limit": null
     }
   ]
 }

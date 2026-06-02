@@ -245,12 +245,13 @@ function Build-HookAdditions {
     function HookCmd($script) { return "`"$node`" `"$(Join-Path $HooksDir $script)`"" }
     # 按用户偏好：不注册 shell / MCP 审批 hook（命令直接执行，不走飞书逐条把关）。
     # 如需恢复审批，取消下面两行注释即可。
+    # 注：preToolUse 对内置交互工具（AskQuestion / SwitchMode）实测不触发，故不再注册。
+    # timeout 单位为秒，且 Cursor 内部用 32 位毫秒定时器（上限约 24.8 天）——
+    # 切勿超过该上限，否则定时器溢出会导致 stop hook 一启动即被杀（卡片完全收不到）。
+    # 1209600 秒 = 14 天，足够“等同永久”，且安全落在上限内。loop_limit=null 表示飞书多轮往返无上限。
     return [ordered]@{
-        # beforeShellExecution = @(@{ command = (HookCmd "shell-approve.js"); timeout = 600 })
-        # beforeMCPExecution   = @(@{ command = (HookCmd "mcp-approve.js");   timeout = 600 })
-        preToolUse           = @(@{ command = (HookCmd "pretool-approve.js"); matcher = "AskQuestion|SwitchMode"; timeout = 600 })
         afterAgentResponse   = @(@{ command = (HookCmd "agent-response.js"); timeout = 5 })
-        stop                 = @(@{ command = (HookCmd "on-stop.js"); timeout = 31536000; loop_limit = 20 })
+        stop                 = @(@{ command = (HookCmd "on-stop.js"); timeout = 1209600; loop_limit = $null })
     }
 }
 

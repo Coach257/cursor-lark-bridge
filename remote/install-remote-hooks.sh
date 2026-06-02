@@ -204,8 +204,8 @@ req = urllib.request.Request(
     method="POST",
 )
 try:
-    # 无限等待：与本地 Windows 版一致，stop 卡片永久存在直到手动结束
-    with urllib.request.urlopen(req, timeout=31536000) as r:
+    # 长等待（14 天，等同永久）：与 hooks.json 的 stop timeout 对齐，stop 卡片长期存在直到手动结束
+    with urllib.request.urlopen(req, timeout=1209600) as r:
         sys.stdout.write(r.read().decode("utf-8", errors="replace"))
 except Exception:
     sys.stdout.write("")
@@ -515,9 +515,13 @@ ALL_CLB_EVENTS = (
 additions = {
     # "beforeShellExecution": [{"command": h("shell-approve.sh"), "timeout": 600}],
     # "beforeMCPExecution":   [{"command": h("mcp-approve.sh"),   "timeout": 600}],
-    "preToolUse":           [{"command": h("pretool-approve.sh"), "matcher": "AskQuestion|SwitchMode", "timeout": 600}],
+    # 注：preToolUse 对内置交互工具（AskQuestion / SwitchMode）实测不触发，故不再注册；
+    #     从 additions 移除后，合并逻辑会顺带清掉远程上历史遗留的 preToolUse 条目。
+    # 重要：timeout 单位为秒，Cursor 内部用 32 位毫秒定时器（上限约 24.8 天）。
+    #     切勿超过该上限，否则定时器溢出会导致 stop hook 一启动即被杀（飞书完全收不到卡片）。
+    #     1209600 秒 = 14 天，等同永久且安全；loop_limit=None(→null) 表示飞书多轮往返无上限。
     "afterAgentResponse":   [{"command": h("agent-response.sh"), "timeout": 5}],
-    "stop":                 [{"command": h("on-stop.sh"), "timeout": 31536000, "loop_limit": 20}],
+    "stop":                 [{"command": h("on-stop.sh"), "timeout": 1209600, "loop_limit": None}],
 }
 
 doc = {}
